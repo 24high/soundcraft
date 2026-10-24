@@ -15,7 +15,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{Vst3Error, scan};
-use soundcraft_dsp::Transport;
+use soundcraft_dsp::{MidiOut, Transport};
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
@@ -533,6 +533,9 @@ impl Bundle {
             // SAFETY: `ProcessContext` is plain data (numbers and small structs); all-zero is valid.
             context: unsafe { std::mem::zeroed() },
             event_in: false,
+            event_out: false,
+            event_out_buses: 0,
+            midi_out: Vec::with_capacity(EVENT_CAP),
             editor: Arc::new(EditorLink::default()),
             component,
             host,
@@ -845,7 +848,8 @@ impl IEventListTrait for EventList {
         // SAFETY: in-pointer from the plugin (or null, handled).
         let Some(&ev) = (unsafe { e.as_ref() }) else { return sb::kInvalidArgument };
         let cap = self.cap;
-        // Output events (e.g. MIDI out) are accepted while there is room; SoundCraft ignores them.
+        // Output events (e.g. MIDI out) are accepted while there is room; the instance converts
+        // supported channel messages after `process` and drops unsupported or malformed events.
         match self.with(|v| {
             if v.len() < cap {
                 v.push(ev);
@@ -963,20 +967,21 @@ impl IBStreamTrait for MemoryStream {
 /// A host → plugin note event, safe to build anywhere; converted inside `process`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum NoteEvent {
-    On { time: u32, key: u8, velocity: f32 },
-    Off { time: u32, key: u8 },
-    Pressure { time: u32, key: u8, pressure: f32 },
+    On { time: u32, channel: u8, key: u8, velocity: f32 },
+    Off { time: u32, channel: u8, key: u8, velocity: f32 },
+    Pressure { time: u32, channel: u8, key: u8, pressure: f32 },
+    Midi { time: u32, msg: [u8; 3] },
 }
 
 impl NoteEvent {
     pub fn time(&self) -> u32 {
         match *self {
-            NoteEvent::On { time, .. } | NoteEvent::Off { time, .. } | NoteEvent::Pressure { time, .. } => time,
+            NoteEvent::On { time, .. } | NoteEvent::Off { time, .. } | NoteEvent::Pressure { time, .. } | NoteEvent::Midi { time, .. } => time,
         }
     }
     pub fn set_time(&mut self, t: u32) {
         match self {
-            NoteEvent::On { time, .. } | NoteEvent::Off { time, .. } | NoteEvent::Pressure { time, .. } => *time = t,
+            NoteEvent::On { time, .. } | NoteEvent::Off { time, .. } | NoteEvent::Pressure { time, .. } | NoteEvent::Midi { time, .. } => *time = t,
         }
     }
 
@@ -987,17 +992,40 @@ impl NoteEvent {
         e.sampleOffset = i32::try_from(self.time().saturating_sub(offset)).unwrap_or(0);
         e.flags = sv::Event_::EventFlags_::kIsLive as u16;
         match self {
-            NoteEvent::On { key, velocity, .. } => {
+            NoteEvent::On { channel, key, velocity, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kNoteOnEvent as u16;
-                e.__field0.noteOn = sv::NoteOnEvent { channel: 0, pitch: i16::from(key), tuning: 0.0, velocity, length: 0, noteId: -1 };
+                e.__field0.noteOn =
+                    sv::NoteOnEvent { channel: i16::from(channel), pitch: i16::from(key), tuning: 0.0, velocity, length: 0, noteId: -1 };
             }
-            NoteEvent::Off { key, .. } => {
+            NoteEvent::Off { channel, key, velocity, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kNoteOffEvent as u16;
-                e.__field0.noteOff = sv::NoteOffEvent { channel: 0, pitch: i16::from(key), velocity: 0.0, noteId: -1, tuning: 0.0 };
+                e.__field0.noteOff = sv::NoteOffEvent { channel: i16::from(channel), pitch: i16::from(key), velocity, noteId: -1, tuning: 0.0 };
             }
-            NoteEvent::Pressure { key, pressure, .. } => {
+            NoteEvent::Pressure { channel, key, pressure, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kPolyPressureEvent as u16;
-                e.__field0.polyPressure = sv::PolyPressureEvent { channel: 0, pitch: i16::from(key), pressure, noteId: -1 };
+                e.__field0.polyPressure = sv::PolyPressureEvent { channel: i16::from(channel), pitch: i16::from(key), pressure, noteId: -1 };
+            }
+            NoteEvent::Midi { msg, .. } => {
+                let [status, data1, data2] = msg;
+                let channel = i8::try_from(status & 0x0f).unwrap_or(0);
+                match status & 0xf0 {
+                    0xb0 => {
+                        e.r#type = sv::Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
+                        e.__field0.midiCCOut =
+                            sv::LegacyMIDICCOutEvent { channel, controlNumber: data1 & 0x7f, value: (data2 & 0x7f) as i8, value2: 0 };
+                    }
+                    0xc0 | 0xd0 | 0xe0 => {
+                        e.r#type = sv::Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
+                        let (control_number, value, value2) = match status & 0xf0 {
+                            0xc0 => (sv::ControllerNumbers_::kCtrlProgramChange as u8, data1 & 0x7f, 0),
+                            0xd0 => (sv::ControllerNumbers_::kAfterTouch as u8, data1 & 0x7f, 0),
+                            _ => (sv::ControllerNumbers_::kPitchBend as u8, data1 & 0x7f, data2 & 0x7f),
+                        };
+                        e.__field0.midiCCOut =
+                            sv::LegacyMIDICCOutEvent { channel, controlNumber: control_number, value: value as i8, value2: value2 as i8 };
+                    }
+                    _ => {}
+                }
             }
         }
         e
@@ -1082,6 +1110,8 @@ pub(crate) struct Layout {
     pub inputs: Vec<u32>,
     pub outputs: Vec<u32>,
     pub event_input: bool,
+    /// The plugin has an event (MIDI) output bus that we activated: it may produce MIDI.
+    pub event_output: bool,
 }
 
 fn apply_transport(c: &mut sv::ProcessContext, t: &Transport) {
@@ -1123,6 +1153,13 @@ pub(crate) struct Instance {
     out_events: ComWrapper<EventList>,
     context: sv::ProcessContext,
     event_in: bool,
+    /// The event output bus is active, so `out_events` is where the plugin writes its MIDI.
+    event_out: bool,
+    /// Number of output event buses activated during configuration.
+    event_out_buses: i32,
+    /// MIDI converted out of `out_events` by the last `process` call, in time order, block
+    /// relative. Preallocated: `process` never allocates.
+    midi_out: Vec<MidiOut>,
     editor: Arc<EditorLink>,
     // Field order matters for drop: `Drop::drop` shuts the plugin down first; then the component
     // and host objects are released, and the bundle (which keeps the code mapped) goes last.
@@ -1321,7 +1358,7 @@ impl Instance {
 
     /// Stops processing, deactivates, negotiates the bus layout (main buses mono or stereo as
     /// asked, falling back to stereo and then to the plugin's own choice), activates the main
-    /// buses, sets up 32-bit processing and activates the component.
+    /// audio and event buses, sets up 32-bit processing and activates the component.
     pub fn configure(&mut self, sample_rate: f64, max_frames: usize, mono: bool) -> Result<Layout, Vst3Error> {
         self.shutdown();
         let audio = sv::MediaTypes_::kAudio;
@@ -1346,7 +1383,9 @@ impl Instance {
             }
             // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
             // outlive the call.
-            if ok(unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) }) {
+            let in_ptr = if ins.is_empty() { std::ptr::null_mut() } else { ins.as_mut_ptr() };
+            let out_ptr = if outs.is_empty() { std::ptr::null_mut() } else { outs.as_mut_ptr() };
+            if ok(unsafe { p.setBusArrangements(in_ptr, nin, out_ptr, nout) }) {
                 tried_ok = true;
                 break;
             }
@@ -1357,10 +1396,13 @@ impl Instance {
         if !tried_ok {
             log::debug!("vst3: plugin refused mono/stereo bus arrangements; using its own");
         }
+        let event_inputs = self.bus_count(event, din);
+        let event_outputs = self.bus_count(event, dout);
         let layout = Layout {
             inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
             outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
-            event_input: self.bus_count(event, din) > 0,
+            event_input: event_inputs > 0,
+            event_output: event_outputs > 0,
         };
         // Main buses on, aux buses off (VST3 still gets buffers for every bus).
         for (dir, n) in [(din, nin), (dout, nout)] {
@@ -1369,11 +1411,19 @@ impl Instance {
                 unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(i == 0)) };
             }
         }
-        if layout.event_input {
-            // SAFETY: valid component; event input bus 0 exists.
-            unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, 0, 1) };
+        for i in 0..event_inputs {
+            // SAFETY: valid component; `i` is below the event input bus count.
+            unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, i, u8::from(i == 0)) };
+        }
+        for i in 0..event_outputs {
+            // The event output bus is what lets a MIDI generator report its events; without it a
+            // plugin that only produces MIDI has no audio output to write to either.
+            // SAFETY: valid component; `i` is below the event output bus count.
+            unsafe { self.component.activateBus(event as sv::MediaType, dout as sv::BusDirection, i, 1) };
         }
         self.event_in = layout.event_input;
+        self.event_out = layout.event_output;
+        self.event_out_buses = event_outputs;
         let sample32 = sv::SymbolicSampleSizes_::kSample32 as i32;
         // SAFETY: valid processor.
         if !ok(unsafe { p.canProcessSampleSize(sample32) }) {
@@ -1473,6 +1523,7 @@ impl Instance {
             }
         });
         self.out_events.with(Vec::clear);
+        self.midi_out.clear();
         inputs.refresh();
         outputs.refresh();
         self.context.continousTimeSamples = project_time;
@@ -1499,7 +1550,119 @@ impl Instance {
         // parameter/event objects and the context are owned by `self` and untouched until the
         // call returns.
         let r = unsafe { p.process(&mut data) };
+        if ok(r) && self.event_out {
+            // The plugin has written its MIDI into `out_events`: convert it now, while the events
+            // are still there, into MIDI 1.0 messages stamped with their offset in this block
+            // (`offset` is where this block starts in the caller's block). Bounded: at most
+            // `EVENT_CAP` per block, no allocation.
+            let midi = &mut self.midi_out;
+            let event_out_buses = self.event_out_buses;
+            self.out_events.with(|v| {
+                for e in v.drain(..).take(EVENT_CAP) {
+                    let Ok(sample_offset) = usize::try_from(e.sampleOffset) else { continue };
+                    if sample_offset >= frames || e.busIndex < 0 || e.busIndex >= event_out_buses {
+                        continue;
+                    }
+                    if let Some(msg) = event_to_midi(&e)
+                        && let Some(at) = u32::try_from(sample_offset).ok().and_then(|sample_offset| offset.checked_add(sample_offset))
+                        && midi.len() < midi.capacity()
+                    {
+                        midi.push(MidiOut { offset: at, msg });
+                    }
+                }
+            });
+        } else {
+            self.out_events.with(Vec::clear);
+        }
         if ok(r) { Ok(()) } else { Err(Vst3Error::Process(format!("process returned {r}"))) }
+    }
+
+    /// True when the plugin has an event (MIDI) output bus, whether or not it is configured yet.
+    pub fn has_event_output(&self) -> bool {
+        self.bus_count(sv::MediaTypes_::kEvent, sv::BusDirections_::kOutput) > 0
+    }
+
+    /// MIDI the plugin produced in the last [`Instance::process`] call, oldest first, each with
+    /// its offset in that block. Takes them: a second call yields nothing.
+    pub fn take_midi_out(&mut self, sink: &mut dyn FnMut(MidiOut)) {
+        for e in self.midi_out.drain(..) {
+            sink(e);
+        }
+    }
+}
+
+/// A 0..1 VST3 event value as a MIDI 1.0 data byte (0..=127).
+fn midi_byte(v: f32) -> Option<u8> {
+    if !v.is_finite() {
+        return None;
+    }
+    let x = (f64::from(v) * 127.0).round();
+    u8::try_from(x.clamp(0.0, 127.0) as i64).ok()
+}
+
+/// A VST3 note number as the 0..=127 byte a channel voice message carries.
+fn note_byte(p: i16) -> Option<u8> {
+    u8::try_from(p).ok().filter(|p| *p < 128)
+}
+
+/// A VST3 channel (0..15) as the low nibble of a status byte.
+fn channel_nibble(c: i16) -> Option<u8> {
+    u8::try_from(c).ok().filter(|c| *c < 16)
+}
+
+/// A `LegacyMIDICCOutEvent` value byte as a MIDI data byte.
+fn cc_byte(v: i8) -> u8 {
+    (v as u8) & 0x7F
+}
+
+/// Converts one VST3 output event into a MIDI 1.0 channel message: the status byte with the
+/// channel in its low nibble, then two data bytes. Note on/off, polyphonic and channel pressure,
+/// pitch bend, program change and control change all survive losslessly (channel and sample
+/// offset are kept by the caller). Events with no MIDI 1.0 equivalent (raw data, note
+/// expressions, chords, scales, system realtime) return `None`.
+pub(crate) fn event_to_midi(e: &sv::Event) -> Option<[u8; 3]> {
+    // The flag constants are the C default enum type: i32 on Windows, u32 elsewhere.
+    #[allow(clippy::unnecessary_cast)]
+    match u32::from(e.r#type) {
+        t if t == sv::Event_::EventTypes_::kNoteOnEvent as u32 => {
+            // SAFETY: `Event` is plain data and the union field matches the type just checked.
+            let n = unsafe { e.__field0.noteOn };
+            Some([0x90 | channel_nibble(n.channel)?, note_byte(n.pitch)?, midi_byte(n.velocity)?])
+        }
+        t if t == sv::Event_::EventTypes_::kNoteOffEvent as u32 => {
+            // SAFETY: as above.
+            let n = unsafe { e.__field0.noteOff };
+            Some([0x80 | channel_nibble(n.channel)?, note_byte(n.pitch)?, midi_byte(n.velocity)?])
+        }
+        t if t == sv::Event_::EventTypes_::kPolyPressureEvent as u32 => {
+            // SAFETY: as above.
+            let n = unsafe { e.__field0.polyPressure };
+            Some([0xA0 | channel_nibble(n.channel)?, note_byte(n.pitch)?, midi_byte(n.pressure)?])
+        }
+        t if t == sv::Event_::EventTypes_::kLegacyMIDICCOutEvent as u32 => {
+            // SAFETY: as above.
+            let c = unsafe { e.__field0.midiCCOut };
+            let ch = channel_nibble(i16::from(c.channel))?;
+            let value = cc_byte(c.value);
+            match u32::from(c.controlNumber) {
+                // A plain control change: the number is data1, the value data2.
+                0..=127 => Some([0xB0 | ch, c.controlNumber & 0x7F, value]),
+                // The SDK's extra numbers (midictls.h) carry the other channel messages.
+                x if x == sv::ControllerNumbers_::kAfterTouch as u32 => Some([0xD0 | ch, value, 0]),
+                x if x == sv::ControllerNumbers_::kPitchBend as u32 => {
+                    // 14-bit: data1 is the low 7 bits, data2 the high ones.
+                    let bend = u32::from(value) | (u32::from(cc_byte(c.value2)) << 7);
+                    Some([0xE0 | ch, (bend & 0x7F) as u8, ((bend >> 7) & 0x7F) as u8])
+                }
+                x if x == sv::ControllerNumbers_::kCtrlProgramChange as u32 => Some([0xC0 | ch, value, 0]),
+                x if x == sv::ControllerNumbers_::kCtrlPolyPressure as u32 => Some([0xA0 | ch, value, cc_byte(c.value2)]),
+                // Quarter frame, song select/pointer, clock, sensing: no MIDI 1.0 channel message.
+                _ => None,
+            }
+        }
+        // kDataEvent carries a pointer to raw bytes we do not own, and the note-expression,
+        // chord and scale events have no MIDI 1.0 equivalent.
+        _ => None,
     }
 }
 
@@ -1655,6 +1818,7 @@ impl EditorLink {
         if let Some(w) = &g.window {
             if w.is_visible() {
                 w.raise();
+                w.focus();
                 return Ok(());
             }
             // The user closed the window: start over.
@@ -1683,7 +1847,11 @@ impl EditorLink {
             win.close();
             return Err("the editor could not attach to its window".into());
         }
+        // Show the window now: mapping and placing it sends the configure event that tells the
+        // plugin (through a bridge) how big its window really is.
+        win.map();
         win.raise();
+        win.focus();
         g.view = Some(view);
         g.frame = Some(frame);
         g.window = Some(win);
@@ -1762,7 +1930,13 @@ impl EditorLink {
             return;
         }
         let mut g = self.lock();
-        if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
+        let mut gone = false;
+        if let Some(w) = g.window.as_mut() {
+            // Reads the window's events (X11): the user closing the window ends the editor.
+            w.pump();
+            gone = !w.is_visible();
+        }
+        if gone {
             EditorLink::teardown(&mut g);
         }
     }
@@ -1894,6 +2068,10 @@ mod window {
             self.get().and_then(|w| w.contentView()).map_or(std::ptr::null_mut(), |v| Retained::as_ptr(&v).cast_mut().cast())
         }
 
+        /// Nothing to focus separately: the view's own window takes the keyboard on this
+        /// platform.
+        pub fn focus(&self) {}
+
         pub fn raise(&self) {
             if let Some(w) = self.get() {
                 w.makeKeyAndOrderFront(None);
@@ -1903,6 +2081,12 @@ mod window {
         pub fn is_visible(&self) -> bool {
             self.get().is_some_and(|w| w.isVisible())
         }
+
+        /// AppKit delivers the window events; nothing to pump.
+        pub fn pump(&mut self) {}
+
+        /// The window is shown when it is created.
+        pub fn map(&self) {}
 
         pub fn close(self) {
             if let Some(w) = self.get() {
@@ -2064,6 +2248,10 @@ mod window {
             self.live().unwrap_or(std::ptr::null_mut())
         }
 
+        /// Nothing to focus separately: the view's own window takes the keyboard on this
+        /// platform.
+        pub fn focus(&self) {}
+
         pub fn raise(&self) {
             if let Some(h) = self.live() {
                 // SAFETY: a live window of this thread.
@@ -2078,6 +2266,12 @@ mod window {
             // SAFETY: a live window of this thread.
             self.live().is_some_and(|h| unsafe { IsWindowVisible(h) } != 0)
         }
+
+        /// The message loop delivers the window events; nothing to pump.
+        pub fn pump(&mut self) {}
+
+        /// The window is shown when it is created.
+        pub fn map(&self) {}
 
         pub fn close(self) {
             if let Some(h) = self.live() {
@@ -2101,8 +2295,337 @@ mod window {
     }
 }
 
+/// Linux and the BSDs: an X11 parent window for plugin views.
+///
+/// VST3's platform type there is `X11EmbedWindowID`: the host creates a window, hands the
+/// plugin its X11 window id, and the plugin creates its own child window inside it. `libX11` is
+/// loaded at run time through `x11-dl`, so building SoundCraft needs no X11 development files.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+mod window {
+    use std::ffi::{CString, c_char, c_void};
+    use std::sync::{Mutex, PoisonError};
+    use std::thread::ThreadId;
+    use x11_dl::xlib::{self, Display, Window as XWindow, XEvent};
+
+    /// The VST3 platform type for X11 embedding.
+    pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeX11EmbedWindowID);
+
+    /// The thread that owns the X display. Xlib is only thread-safe when it is initialized for
+    /// threads, and the app's own X connection (winit) may already be up, so every X call happens
+    /// on the thread that opened the display: the one that opened the editor.
+    static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+    /// True on the thread that may talk to X.
+    pub fn on_main_thread() -> bool {
+        match *OWNER.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(owner) => owner == std::thread::current().id(),
+            // Nobody has opened a display yet: the next one to do so becomes its owner.
+            None => true,
+        }
+    }
+
+    /// Remembers the calling thread as the display's owner.
+    fn claim() {
+        let mut owner = OWNER.lock().unwrap_or_else(PoisonError::into_inner);
+        if owner.is_none() {
+            *owner = Some(std::thread::current().id());
+        }
+    }
+
+    /// A top-level X11 window the plugin's view embeds itself into. Holds the X connection;
+    /// owner thread only.
+    pub struct HostWindow {
+        xlib: x11_dl::xlib::Xlib,
+        display: *mut Display,
+        window: XWindow,
+        width: u32,
+        height: u32,
+        /// When the keyboard focus was last handed to the plugin, so `pump` does not ask on
+        /// every frame.
+        focus_checked: std::time::Instant,
+        /// The `WM_DELETE_WINDOW` atom, so a close request through it is recognized.
+        delete: x11_dl::xlib::Atom,
+        /// Set when the window manager asked the window to close.
+        closing: bool,
+    }
+
+    // SAFETY: the display is only used on the thread that opened it (see `OWNER`); the struct
+    // carries the pointer between the locks of the editor link.
+    unsafe impl Send for HostWindow {}
+
+    impl HostWindow {
+        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+            let xlib = x11_dl::xlib::Xlib::open().map_err(|e| format!("cannot load libX11: {e}"))?;
+            // SAFETY: a null display name opens the display named by $DISPLAY.
+            let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
+            if display.is_null() {
+                return Err("cannot open the X display (is $DISPLAY set?)".into());
+            }
+            claim();
+            // SAFETY: a valid display.
+            let screen = unsafe { (xlib.XDefaultScreen)(display) };
+            // SAFETY: a valid display and screen.
+            let root = unsafe { (xlib.XRootWindow)(display, screen) };
+            // SAFETY: a valid display and screen.
+            let black = unsafe { (xlib.XBlackPixel)(display, screen) };
+            let width = (w.max(160.0) as u32).min(8192);
+            let height = (h.max(120.0) as u32).min(8192);
+            // A frame-less window at the screen origin. A bridge that runs the plugin in another
+            // process (yabridge through Wine) translates pointer events against the origin of the
+            // Win32 screen, which Wine pins to its own window position; a decorated or moved
+            // window leaves the plugin's clicks shifted by the window's screen position. A window
+            // manager also keeps managed windows off the panel, so only an override-redirect
+            // window keeps the client area on the origin, where screen and window coordinates
+            // coincide and clicks land where the plugin drew.
+            // SAFETY: a valid display and screen.
+            let depth = unsafe { (xlib.XDefaultDepth)(display, screen) };
+            // SAFETY: a valid display and screen.
+            let visual = unsafe { (xlib.XDefaultVisual)(display, screen) };
+            let mut attributes: x11_dl::xlib::XSetWindowAttributes = unsafe { std::mem::zeroed() };
+            attributes.background_pixel = black;
+            attributes.override_redirect = 1;
+            // SAFETY: a valid display, root window and visual; a window without a border whose
+            // attributes are initialized above.
+            let window = unsafe {
+                (xlib.XCreateWindow)(
+                    display,
+                    root,
+                    0,
+                    0,
+                    width,
+                    height,
+                    0,
+                    depth,
+                    x11_dl::xlib::InputOutput as u32,
+                    visual,
+                    x11_dl::xlib::CWBackPixel | x11_dl::xlib::CWOverrideRedirect,
+                    &mut attributes,
+                )
+            };
+            if window == 0 {
+                // SAFETY: a valid display.
+                unsafe { (xlib.XCloseDisplay)(display) };
+                return Err("cannot create the editor window".into());
+            }
+            // A title with an inner NUL cannot be passed on; an empty name is used instead.
+            let name = CString::new(title).unwrap_or_default();
+            // SAFETY: a valid display and window; `name` outlives the call.
+            unsafe { (xlib.XStoreName)(display, window, name.as_ptr()) };
+            // A window manager that manages the window sends this message on close; an
+            // override-redirect window only ever sees it from an explicit sender.
+            // SAFETY: a valid display; the name is NUL-terminated.
+            let delete = unsafe { (xlib.XInternAtom)(display, c"WM_DELETE_WINDOW".as_ptr(), 0) };
+            if delete != 0 {
+                let mut protocols = [delete];
+                // SAFETY: a valid display, window and atom list.
+                unsafe { (xlib.XSetWMProtocols)(display, window, protocols.as_mut_ptr(), 1) };
+            }
+            // SAFETY: a valid display and window.
+            unsafe {
+                (xlib.XSelectInput)(display, window, xlib::ExposureMask | xlib::StructureNotifyMask | xlib::FocusChangeMask | xlib::EnterWindowMask)
+            };
+            // The window is mapped later (after the plugin attached): mapping and then placing it
+            // sends the ConfigureNotify a bridge like yabridge needs to learn the window's size.
+            // Mapped earlier, that event would be missed and the plugin would be told its window
+            // is 0x0.
+            Ok(HostWindow { xlib, display, window, width, height, focus_checked: std::time::Instant::now(), delete, closing: false })
+        }
+
+        /// The window id the plugin embeds itself into (VST3's `X11EmbedWindowID`).
+        pub fn parent(&self) -> *mut c_void {
+            self.window as *mut c_void
+        }
+
+        /// The raw window handle (for the plug frame's resizes).
+        pub fn raw(&self) -> *mut c_void {
+            self.window as *mut c_void
+        }
+
+        /// Shows the window (after the plugin attached, so the configure event that follows
+        /// reaches the plugin's view).
+        pub fn map(&self) {
+            // SAFETY: a valid display and window.
+            unsafe {
+                (self.xlib.XMapWindow)(self.display, self.window);
+                // An override-redirect window gets no window manager placement, so no
+                // `ConfigureNotify` follows the map. Moving it onto the origin sends one, which
+                // is what a bridge needs to learn the window's real size.
+                (self.xlib.XMoveResizeWindow)(self.display, self.window, 0, 0, self.width, self.height);
+                (self.xlib.XFlush)(self.display);
+            }
+        }
+
+        /// Gives the keyboard focus to the plugin's own X window (the deepest viewable child).
+        /// An override-redirect host window never becomes the window manager's active window,
+        /// and a bridge that only grabs focus for active windows (yabridge) then leaves the
+        /// plugin without keyboard input; its text fields would stay dead.
+        pub fn focus(&self) {
+            let target = self.focus_target();
+            if target == self.window {
+                return;
+            }
+            // SAFETY: a valid display; `target` is a viewable child of our window.
+            unsafe {
+                (self.xlib.XSetInputFocus)(self.display, target, xlib::RevertToParent, xlib::CurrentTime);
+                (self.xlib.XFlush)(self.display);
+            }
+        }
+
+        /// Keeps the editor in front and the keyboard with the plugin while the pointer rests over
+        /// it. An override-redirect window is not managed by the window manager: anything raised
+        /// later (the app itself) would bury it for good, and nothing hands the focus back after
+        /// another window took it, so the plugin's text fields would stop accepting input.
+        fn follow_pointer(&mut self) {
+            if self.focus_checked.elapsed() < std::time::Duration::from_millis(250) {
+                return;
+            }
+            self.focus_checked = std::time::Instant::now();
+            let mut root: XWindow = 0;
+            let mut child: XWindow = 0;
+            let (mut root_x, mut root_y, mut window_x, mut window_y) = (0, 0, 0, 0);
+            let mut mask: u32 = 0;
+            // SAFETY: a valid display and window; every out-parameter is writable.
+            let same_screen = unsafe {
+                (self.xlib.XQueryPointer)(
+                    self.display,
+                    self.window,
+                    &mut root,
+                    &mut child,
+                    &mut root_x,
+                    &mut root_y,
+                    &mut window_x,
+                    &mut window_y,
+                    &mut mask,
+                )
+            };
+            if same_screen == 0 || window_x < 0 || window_y < 0 || window_x >= self.width as i32 || window_y >= self.height as i32 {
+                return;
+            }
+            // An override-redirect window never takes part in the window manager's stacking, so a
+            // window raised later (SoundCraft itself, after any click) covers it for good. Raising
+            // it while the pointer is over its area brings it back, and keeps it usable without a
+            // title bar.
+            // SAFETY: a valid display and window.
+            unsafe {
+                (self.xlib.XRaiseWindow)(self.display, self.window);
+                (self.xlib.XFlush)(self.display);
+            }
+            let target = self.focus_target();
+            if target == self.window {
+                return;
+            }
+            let mut focused: XWindow = 0;
+            let mut revert = 0;
+            // SAFETY: a valid display; both out-parameters are writable.
+            unsafe { (self.xlib.XGetInputFocus)(self.display, &mut focused, &mut revert) };
+            if focused == target {
+                return;
+            }
+            // SAFETY: a valid display; `target` is a viewable child of our window.
+            unsafe {
+                (self.xlib.XSetInputFocus)(self.display, target, xlib::RevertToParent, xlib::CurrentTime);
+                (self.xlib.XFlush)(self.display);
+            }
+        }
+
+        /// The deepest viewable child of our window: the window the plugin's own widgets live in.
+        fn focus_target(&self) -> XWindow {
+            let mut target = self.window;
+            for _ in 0..4 {
+                let mut root: XWindow = 0;
+                let mut parent: XWindow = 0;
+                let mut children: *mut XWindow = std::ptr::null_mut();
+                let mut count: u32 = 0;
+                // SAFETY: a valid display and window; the child array is freed below.
+                let queried = unsafe { (self.xlib.XQueryTree)(self.display, target, &mut root, &mut parent, &mut children, &mut count) };
+                if queried == 0 {
+                    break;
+                }
+                let mut next = target;
+                for index in 0..count as usize {
+                    // SAFETY: XQueryTree returned `count` children in `children`.
+                    let child = unsafe { *children.add(index) };
+                    if child == 0 {
+                        continue;
+                    }
+                    let mut attributes: x11_dl::xlib::XWindowAttributes = unsafe { std::mem::zeroed() };
+                    // SAFETY: a valid display and child window; `attributes` is writable.
+                    let got = unsafe { (self.xlib.XGetWindowAttributes)(self.display, child, &mut attributes) };
+                    if got != 0
+                        && attributes.map_state == xlib::IsViewable
+                        && attributes.class == xlib::InputOutput
+                        && attributes.width > 32
+                        && attributes.height > 32
+                    {
+                        next = child;
+                        break;
+                    }
+                }
+                // SAFETY: the array came from XQueryTree and is not used afterwards.
+                unsafe { (self.xlib.XFree)(children.cast()) };
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            target
+        }
+
+        pub fn raise(&self) {
+            // SAFETY: a valid display and window.
+            unsafe {
+                (self.xlib.XMapRaised)(self.display, self.window);
+                (self.xlib.XFlush)(self.display);
+            }
+        }
+
+        pub fn is_visible(&self) -> bool {
+            !self.closing
+        }
+
+        /// Reads the window's X events: a close request ends the editor, and the pointer keeps
+        /// the window in front of the app with the keyboard focus on the plugin.
+        pub fn pump(&mut self) {
+            self.follow_pointer();
+            // SAFETY: a valid display.
+            while unsafe { (self.xlib.XPending)(self.display) } > 0 {
+                let mut event: XEvent = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid display; `event` is writable and gets a whole event.
+                unsafe { (self.xlib.XNextEvent)(self.display, &mut event) };
+                // SAFETY: the event was just filled by XNextEvent; reading its type is fine.
+                let kind = unsafe { event.type_ };
+                if kind == xlib::EnterNotify {
+                    self.focus();
+                    continue;
+                }
+                if kind != xlib::ClientMessage {
+                    continue;
+                }
+                // SAFETY: the event is a client message; reading its data is fine.
+                let message = unsafe { event.client_message };
+                if message.data.as_longs().first().copied() == Some(self.delete as std::os::raw::c_long) {
+                    self.closing = true;
+                }
+            }
+        }
+
+        pub fn close(self) {
+            // SAFETY: a valid display and window; the display is closed afterwards, so the
+            // pointers in `self` are not used again.
+            unsafe {
+                (self.xlib.XDestroyWindow)(self.display, self.window);
+                (self.xlib.XFlush)(self.display);
+                (self.xlib.XCloseDisplay)(self.display);
+            }
+        }
+    }
+
+    /// The plugin sizes its own child window; the parent keeps the size the plugin asked for.
+    pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
+}
+
 /// Other platforms: no editor windows yet (opening reports "unsupported").
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", windows, all(unix, not(target_os = "macos"), not(target_os = "android")))))]
 mod window {
     use std::ffi::{c_char, c_void};
 
@@ -2124,10 +2647,19 @@ mod window {
         pub fn parent(&self) -> *mut c_void {
             std::ptr::null_mut()
         }
+        /// Gives the keyboard focus to the plugin's own X window (the deepest viewable child).
+        /// An override-redirect host window never becomes the window manager's active window,
+        /// and a bridge that only grabs focus for active windows (yabridge) then leaves the
+        /// plugin without keyboard input; its text fields would stay dead.
+        /// Nothing to focus separately: there is no window on this platform.
+        pub fn focus(&self) {}
+
         pub fn raise(&self) {}
         pub fn is_visible(&self) -> bool {
             false
         }
+        pub fn pump(&mut self) {}
+        pub fn map(&self) {}
         pub fn close(self) {}
     }
 
@@ -2215,7 +2747,7 @@ mod tests {
             assert_ne!(q.getPoint(0, std::ptr::null_mut(), &mut v), sb::kResultOk);
         }
         let el = EventList::new(1);
-        let mut e = NoteEvent::On { time: 5, key: 60, velocity: 1.0 }.to_raw(2);
+        let mut e = NoteEvent::On { time: 5, channel: 2, key: 60, velocity: 1.0 }.to_raw(2);
         // SAFETY: as above.
         unsafe {
             assert_eq!(el.addEvent(&mut e), sb::kResultOk);
@@ -2224,6 +2756,7 @@ mod tests {
             let mut out: sv::Event = std::mem::zeroed();
             assert_eq!(el.getEvent(0, &mut out), sb::kResultOk);
             assert_eq!(out.sampleOffset, 3);
+            assert_eq!(out.__field0.noteOn.channel, 2);
             assert_eq!(out.__field0.noteOn.pitch, 60);
             assert_ne!(el.getEvent(1, &mut out), sb::kResultOk);
         }
@@ -2253,5 +2786,111 @@ mod tests {
         assert_eq!(read_c16(&name), "SoundCraft");
         assert!(h.latency_changed.load(Ordering::Relaxed));
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
+    }
+
+    /// An `Event` with one of the union fields filled in, the way a plugin writes it.
+    fn event(kind: u16, fill: impl FnOnce(&mut sv::Event__type0)) -> sv::Event {
+        let mut e: sv::Event = unsafe { std::mem::zeroed() };
+        e.r#type = kind;
+        // The union fields are all `Copy`, so writing one is safe; the test keeps `kind` and the
+        // field in step, the way a plugin does.
+        fill(&mut e.__field0);
+        e
+    }
+
+    const NOTE_ON: u16 = sv::Event_::EventTypes_::kNoteOnEvent as u16;
+    const NOTE_OFF: u16 = sv::Event_::EventTypes_::kNoteOffEvent as u16;
+    const POLY: u16 = sv::Event_::EventTypes_::kPolyPressureEvent as u16;
+    const CC_OUT: u16 = sv::Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
+
+    #[test]
+    fn output_events_become_midi_channel_messages() {
+        // Note on/off: channel, note number and velocity survive; the offsets travel with the
+        // event, not through the message.
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: 9, pitch: 64, tuning: 0.0, velocity: 1.0, length: 0, noteId: 3 });
+        assert_eq!(event_to_midi(&e), Some([0x99, 64, 127]));
+        let e = event(NOTE_OFF, |f| f.noteOff = sv::NoteOffEvent { channel: 0, pitch: 127, velocity: 0.5, noteId: 0, tuning: 0.0 });
+        assert_eq!(event_to_midi(&e), Some([0x80, 127, 64]));
+        let e = NoteEvent::Off { time: 0, channel: 3, key: 60, velocity: 0.5 }.to_raw(0);
+        // SAFETY: `to_raw` sets the event kind and matching `noteOff` union member.
+        unsafe {
+            assert_eq!(e.__field0.noteOff.channel, 3);
+            assert_eq!(e.__field0.noteOff.velocity, 0.5);
+        }
+        // Poly pressure, both as its own event and as the SDK's extra controller number.
+        let e = event(POLY, |f| f.polyPressure = sv::PolyPressureEvent { channel: 15, pitch: 60, pressure: 77.0 / 127.0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), Some([0xAF, 60, 77]));
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 2, controlNumber: 131, value: 60, value2: 77 });
+        assert_eq!(event_to_midi(&e), Some([0xA2, 60, 77]));
+        // A plain control change keeps its number and value.
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 3, controlNumber: 7, value: 64, value2: 0 });
+        assert_eq!(event_to_midi(&e), Some([0xB3, 7, 64]));
+        // Pitch bend is 14-bit: value is the low 7 bits, value2 the high ones.
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 4, controlNumber: 129, value: 52, value2: 42 });
+        assert_eq!(event_to_midi(&e), Some([0xE4, 52, 42]));
+        // Centre is 64/0 in MIDI 1.0 terms, which is what a plugin sending 0..127 means.
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 4, controlNumber: 129, value: 0, value2: 64 });
+        assert_eq!(event_to_midi(&e), Some([0xE4, 0, 64]));
+        // Program change and channel pressure.
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 11, controlNumber: 130, value: 42, value2: 0 });
+        assert_eq!(event_to_midi(&e), Some([0xCB, 42, 0]));
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 1, controlNumber: 128, value: 33, value2: 0 });
+        assert_eq!(event_to_midi(&e), Some([0xD1, 33, 0]));
+    }
+
+    #[test]
+    fn hostile_or_untranslatable_output_events_are_dropped() {
+        // Raw data (a pointer into the plugin's memory) and the note-expression, chord and scale
+        // events have no MIDI 1.0 channel equivalent.
+        for kind in [sv::Event_::EventTypes_::kDataEvent as u16, 4, 5, 8, 6, 7, 16_384, 60_000] {
+            let e = event(kind, |_| {});
+            assert_eq!(event_to_midi(&e), None, "event type {kind}");
+        }
+        // System realtime / common numbers (132 and up) are not channel messages either.
+        let e = event(CC_OUT, |f| f.midiCCOut = sv::LegacyMIDICCOutEvent { channel: 0, controlNumber: 132, value: 1, value2: 0 });
+        assert_eq!(event_to_midi(&e), None);
+        // A channel outside 0..15 can't be a status nibble; a NaN velocity is not a byte.
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: 16, pitch: 60, tuning: 0.0, velocity: 1.0, length: 0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), None);
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: -3, pitch: 60, tuning: 0.0, velocity: 1.0, length: 0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), None);
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: 0, pitch: 60, tuning: 0.0, velocity: f32::NAN, length: 0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), None);
+        // Invalid note numbers are dropped rather than wrapped or silently changed.
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: 0, pitch: -5, tuning: 0.0, velocity: 2.0, length: 0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), None);
+        let e = event(NOTE_ON, |f| f.noteOn = sv::NoteOnEvent { channel: 0, pitch: 900, tuning: 0.0, velocity: 0.5, length: 0, noteId: 0 });
+        assert_eq!(event_to_midi(&e), None);
+    }
+
+    /// A bridge that runs the plugin in another process (yabridge through Wine) translates the
+    /// plugin's pointer events against the Win32 screen origin, so the editor window has to stay
+    /// an unmanaged window at (0, 0): a window manager that decorates or moves it shifts every
+    /// click away from the control under the pointer. The window is never mapped here, so this
+    /// neither flashes nor takes the focus.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    #[test]
+    fn the_editor_window_is_override_redirect_at_the_screen_origin() {
+        let Ok(win) = window::HostWindow::new("SoundCraft editor test", 320.0, 240.0) else {
+            return; // No X display (headless run): there is nothing to observe.
+        };
+        let Ok(xlib) = x11_dl::xlib::Xlib::open() else {
+            win.close();
+            return;
+        };
+        // SAFETY: a null display name opens the display named by $DISPLAY; `attributes` is
+        // writable. The window id is the one this thread just created and never mapped.
+        unsafe {
+            let display = (xlib.XOpenDisplay)(std::ptr::null());
+            if !display.is_null() {
+                let mut attributes: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+                let got = (xlib.XGetWindowAttributes)(display, win.raw() as x11_dl::xlib::Window, &mut attributes);
+                (xlib.XCloseDisplay)(display);
+                assert_ne!(got, 0, "the editor window has attributes");
+                assert_eq!(attributes.override_redirect, 1, "the window manager must not move the editor off the origin");
+                assert_eq!((attributes.x, attributes.y), (0, 0), "screen and window coordinates coincide only at the origin");
+            }
+        }
+        win.close();
     }
 }

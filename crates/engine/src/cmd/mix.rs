@@ -3,7 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, Insert, SEND_SLOTS, SendSlot, Session, TrackId};
+use soundcraft_model::{AutoParam, AutomationMode, INSERT_SLOTS, Insert, SEND_SLOTS, SendSlot, Session, TrackId, TrackKind};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -124,6 +124,7 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({}))
         }),
         cmd!("mix.send_level", "Send Level", [], None, "{track?, slot, db?, pan?, mute?, pre_fader?}", has_selection, send_level),
+        cmd!("mix.midi_out", "Route MIDI To Track", [], None, "{track?, to?: id|name, on?: true}", always, midi_out),
         cmd!("mix.new_bus", "New Bus", [], None, "{name, format?: stereo}", always, |e, p| {
             let name = str_param(p, "name").filter(|n| !n.trim().is_empty()).ok_or_else(|| bad("mix.new_bus", "`name` required"))?.to_string();
             let fmt = str_param(p, "format").and_then(soundcraft_model::ChannelFormat::from_id).unwrap_or(soundcraft_model::ChannelFormat::Stereo);
@@ -300,6 +301,17 @@ fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     let explicit = slot_of(p, "slot", INSERT_SLOTS);
     let s = e.session_mut();
     let tr = s.track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
+    if info.is_midi_processor || (info.midi_out && !info.is_instrument) {
+        return Err(bad("mix.insert", format!("`{plugin}` is a MIDI processor and cannot run as an audio insert")));
+    }
+    // An instrument or a MIDI generator in one of a MIDI track's inserts would never see that
+    // track's MIDI: the mixer only feeds MIDI to the instrument slot.
+    if (info.is_instrument || info.midi_out) && tr.kind.is_midi() {
+        return Err(bad(
+            "mix.insert",
+            format!("`{plugin}` works with MIDI: on a MIDI or instrument track it belongs in the INSTRUMENT slot (mix.instrument)"),
+        ));
+    }
     let slot =
         explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
     let mut ins = Insert::new(info.id);
@@ -455,6 +467,61 @@ fn send_level(e: &mut Engine, p: &Value) -> Result<Value> {
         sl.pre_fader = m;
     }
     Ok(json!({"send": sl.clone()}))
+}
+
+/// Real-time MIDI routing (the incumbent's Track > MIDI Output Path): feed one track's MIDI to
+/// another track's instrument, next to it in the mix. `on: false` un-routes it.
+fn midi_out(e: &mut Engine, p: &Value) -> Result<Value> {
+    let from = track_param(e, "mix.midi_out", p, "track")?
+        .or_else(|| e.session().edit.selected_tracks.first().copied())
+        .ok_or_else(|| bad("mix.midi_out", "`track` required (or select a track)"))?;
+    let to = track_param(e, "mix.midi_out", p, "to")?;
+    let on = bool_or(p, "on", true);
+    if !on && to.is_none() {
+        let s = e.session_mut();
+        let cleared = s.track(from).map(|t| t.midi_out.clone()).unwrap_or_default();
+        if let Some(t) = s.track_mut(from) {
+            t.midi_out.clear();
+        }
+        return Ok(json!({"track": from, "on": false, "routes": [], "cleared": cleared}));
+    }
+    let to = to.ok_or_else(|| bad("mix.midi_out", "`to` required (a track id or name)"))?;
+    if on && from == to {
+        return Err(bad("mix.midi_out", "a track cannot feed its own MIDI to itself"));
+    }
+    {
+        let s = e.session();
+        let (Some(src), Some(dst)) = (s.track(from), s.track(to)) else {
+            return Err(bad("mix.midi_out", "no such track"));
+        };
+        if on {
+            if matches!(src.kind, TrackKind::Master | TrackKind::Vca) {
+                return Err(bad("mix.midi_out", "master and VCA tracks have no MIDI to route"));
+            }
+            if !dst.kind.is_midi() || dst.instrument.is_none() {
+                return Err(bad(
+                    "mix.midi_out",
+                    format!("`{}` has no MIDI instrument slot to feed: assign an instrument to a MIDI or instrument track", dst.name),
+                ));
+            }
+            if !src.kind.is_midi() {
+                return Err(bad("mix.midi_out", "the source must be a MIDI or instrument track"));
+            }
+            if s.midi_creates_cycle(from, to) {
+                return Err(bad("mix.midi_out", "that would close a MIDI feedback loop"));
+            }
+        }
+    }
+    let s = e.session_mut();
+    if on {
+        if !s.connect_midi(from, to) {
+            return Err(bad("mix.midi_out", "cannot route that MIDI (unknown track or a feedback loop)"));
+        }
+    } else if !s.disconnect_midi(from, to) {
+        return Err(bad("mix.midi_out", "that route does not exist"));
+    }
+    let routes = s.track(from).map(|t| t.midi_out.clone()).unwrap_or_default();
+    Ok(json!({"track": from, "to": to, "on": on, "routes": routes}))
 }
 
 fn lane_param(p: &Value, cmd: &str) -> Result<AutoParam> {
@@ -839,6 +906,68 @@ mod tests {
     }
 
     #[test]
+    fn midi_routing_connects_by_id_and_name_and_refuses_bad_pairs() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "instrument", "name": "Gen"})).unwrap();
+        e.execute("track.new", &json!({"kind": "instrument", "name": "Synth"})).unwrap();
+        e.execute("track.new", &json!({"kind": "audio", "name": "Gtr"})).unwrap();
+        let (g, synth, gtr) = (e.session().tracks[0].id, e.session().tracks[1].id, e.session().tracks[2].id);
+
+        // Connect by id, then by name: both land on the same route.
+        let r = e.execute("mix.midi_out", &json!({"track": g.0, "to": synth.0})).unwrap();
+        assert_eq!(r["routes"], json!([synth.0]));
+        e.execute("mix.midi_out", &json!({"track": g.0, "to": synth.0, "on": false})).unwrap();
+        let r = e.execute("mix.midi_out", &json!({"track": g.0, "to": "Synth"})).unwrap();
+        assert_eq!(r["routes"], json!([synth.0]));
+        assert!(e.session().track(g).unwrap().midi_out.contains(&synth));
+
+        // A track cannot feed itself, and an audio track with no instrument has nothing to feed.
+        assert!(e.execute("mix.midi_out", &json!({"track": g.0, "to": g.0})).is_err());
+        let err = e.execute("mix.midi_out", &json!({"track": g.0, "to": gtr.0})).unwrap_err();
+        assert!(err.to_string().contains("instrument slot"), "{err}");
+
+        // A MIDI destination without an assigned instrument would silently discard the routed
+        // events, so it is not a valid target either.
+        e.execute("track.new", &json!({"kind": "midi", "name": "Empty"})).unwrap();
+        let empty = e.session().track_by_name("Empty").unwrap().id;
+        let err = e.execute("mix.midi_out", &json!({"track": g.0, "to": empty.0})).unwrap_err();
+        assert!(err.to_string().contains("instrument slot"), "{err}");
+        // Audio tracks cannot source routed MIDI.
+        let err = e.execute("mix.midi_out", &json!({"track": gtr.0, "to": synth.0})).unwrap_err();
+        assert!(err.to_string().contains("source"), "{err}");
+
+        // The reverse edge would close a loop, and so would a longer one.
+        let err = e.execute("mix.midi_out", &json!({"track": synth.0, "to": g.0})).unwrap_err();
+        assert!(err.to_string().contains("loop"), "{err}");
+        e.execute("track.new", &json!({"kind": "midi", "name": "Third", "instrument": "drum_synth"})).unwrap();
+        let third = e.session().track_by_name("Third").unwrap().id;
+        e.execute("mix.midi_out", &json!({"track": synth.0, "to": third.0})).unwrap();
+        assert!(e.execute("mix.midi_out", &json!({"track": third.0, "to": g.0})).is_err());
+
+        // Undo puts the route back, redo takes it away again.
+        e.execute("mix.midi_out", &json!({"track": synth.0, "to": third.0, "on": false})).unwrap();
+        e.undo();
+        assert!(e.session().track(synth).unwrap().midi_out.contains(&third));
+        e.redo();
+        assert!(!e.session().track(synth).unwrap().midi_out.contains(&third));
+
+        // `on: false` without `to` clears every route of the track in one step.
+        e.execute("mix.midi_out", &json!({"track": g.0, "to": third.0})).unwrap();
+        assert_eq!(e.session().track(g).unwrap().midi_out, vec![synth, third]);
+        e.execute("mix.midi_out", &json!({"track": g.0, "on": false})).unwrap();
+        assert!(e.session().track(g).unwrap().midi_out.is_empty());
+
+        // Deleting a destination prunes the routes that pointed at it.
+        e.execute("mix.midi_out", &json!({"track": g.0, "to": synth.0})).unwrap();
+        // Existing routes remain removable even if a destination is made temporarily invalid.
+        e.session_mut().track_mut(synth).unwrap().instrument = None;
+        e.execute("mix.midi_out", &json!({"track": g.0, "to": synth.0, "on": false})).unwrap();
+        e.session_mut().track_mut(synth).unwrap().instrument = Some(soundcraft_model::Insert::new("subtractive_synth"));
+        e.execute("track.delete", &json!({"tracks": [synth.0]})).unwrap();
+        assert!(e.session().track(g).unwrap().midi_out.is_empty());
+    }
+
+    #[test]
     fn insert_params_rejects_unknown_and_non_numeric_keys() {
         let mut e = Engine::default();
         e.execute("track.new", &json!({})).unwrap();
@@ -885,5 +1014,19 @@ mod tests {
         let delay = e.session().busses.iter().find(|b| b.name == "Delay").unwrap().id;
         assert_eq!(sl.target, soundcraft_model::Route::Bus(delay));
         assert_eq!((sl.level_db, sl.pan, sl.mute, sl.pre_fader), (-9.0, 0.5, true, true));
+    }
+
+    #[test]
+    fn a_midi_plugin_goes_in_the_instrument_slot_not_an_insert() {
+        // The mixer feeds a track's MIDI to its instrument slot only, so an instrument or a MIDI
+        // generator asked for as an insert is sent there rather than left silent.
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "midi", "name": "Gen"})).unwrap();
+        let err = e.execute("mix.insert", &json!({"track": "Gen", "slot": 0, "plugin": "subtractive_synth"})).unwrap_err().to_string();
+        assert!(err.contains("INSTRUMENT slot"), "{err}");
+        assert!(e.session().track_by_name("Gen").is_some_and(|t| t.instrument.is_none()));
+        // An audio track is unchanged: nothing feeds its inserts, but nothing forbids it either.
+        e.execute("track.new", &json!({"kind": "audio", "name": "Aud"})).unwrap();
+        e.execute("mix.insert", &json!({"track": "Aud", "slot": 0, "plugin": "subtractive_synth"})).unwrap();
     }
 }

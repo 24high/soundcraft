@@ -196,11 +196,22 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         let sr = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 16.0), vec2(inner_w - 4.0, 15.0));
         let slot = track.mixer.inserts.iter().position(|i| i.as_ref().is_some_and(|i| plugin_info(&i.plugin).is_some_and(|p| p.is_instrument)));
         match slot {
-            _ if track.kind == TrackKind::Instrument => instrument_slot(app, ui, track, sr),
-            Some(k) => insert_slot(app, ui, track, k, sr),
-            None if track.kind == TrackKind::Midi => {
-                ui.painter().text(sr.center(), Align2::CENTER_CENTER, "MIDI in: all", regular(9.0), t.text_dim);
+            // Both MIDI and instrument tracks have the instrument slot: the one slot the mixer
+            // feeds MIDI to, where a synth or a MIDI generator goes.
+            _ if track.kind.is_midi() => {
+                let generates_midi =
+                    !track.midi_out.is_empty() || track.instrument.as_ref().and_then(|i| plugin_info(&i.plugin)).is_some_and(|p| p.midi_out);
+                if generates_midi {
+                    // The narrow button at the right is where this generator's MIDI goes: to its
+                    // own instrument and/or other tracks' instruments.
+                    let (slot_r, midi_r) = (sr.with_max_x(sr.max.x - 44.0), sr.with_min_x(sr.max.x - 42.0));
+                    instrument_slot(app, ui, track, slot_r);
+                    midi_out_button(app, ui, track, midi_r);
+                } else {
+                    instrument_slot(app, ui, track, sr);
+                }
             }
+            Some(k) => insert_slot(app, ui, track, k, sr),
             None => {}
         }
         y = sec.max.y + 4.0;
@@ -513,6 +524,66 @@ pub(crate) fn instrument_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, r:
     crate::sampler_window::drop_target(app, ui.ctx(), r, id);
 }
 
+/// The narrow button beside a MIDI-capable strip's instrument slot: where that track's MIDI goes.
+/// Its own instrument is always fed; the menu adds other tracks' instruments (real-time MIDI
+/// routing, the incumbent's "MIDI Output Path").
+fn midi_out_button(app: &mut SoundApp, ui: &mut Ui, track: &Track, r: Rect) {
+    let t = Tokens::current();
+    let id = track.id;
+    let routed = !track.midi_out.is_empty();
+    let resp = ui.interact(r, ui.id().with(("midi_out", id.0)), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "MIDI output path"));
+    raised_key(ui.painter(), r, t.slot_face, resp.hovered());
+    groove(ui.painter(), r.min.x + 27.5, r.min.y + 1.0..=r.max.y - 1.0, t.slot_face[0]);
+    ui.painter().with_clip_rect(r.shrink(1.0)).text(
+        pos2(r.min.x + 13.5, r.center().y),
+        Align2::CENTER_CENTER,
+        "MIDI",
+        bold(8.0),
+        if routed { t.text } else { t.text_dim },
+    );
+    if routed {
+        ui.painter().circle_filled(pos2(r.min.x + 34.5, r.center().y), 2.5, t.accent);
+    }
+    let fed: Vec<String> = track.midi_out.iter().filter_map(|to| app.engine.session().track(*to).map(|x| x.name.clone())).collect();
+    let hover = if fed.is_empty() {
+        "MIDI output path: this track's own instrument\nClick to also feed other tracks' instruments".to_string()
+    } else {
+        format!("MIDI output path: own instrument + {}\nClick to change", fed.join(", "))
+    };
+    egui::Popup::menu(&resp.on_hover_text(hover)).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| midi_out_menu(app, ui, id));
+}
+
+/// The MIDI output path menu: every track with an instrument to feed, ticked when it is fed.
+fn midi_out_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
+    ui.set_min_width(190.0);
+    ui.strong("MIDI Output Path");
+    ui.label(egui::RichText::new("This track always feeds its own instrument.").size(8.0).color(Tokens::current().text_dim));
+    ui.separator();
+    let targets: Vec<(TrackId, String, bool)> = {
+        let s = app.engine.session();
+        let Some(src) = s.track(id) else { return };
+        s.tracks
+            .iter()
+            .filter(|t| t.id != id && t.kind.is_midi() && t.instrument.is_some())
+            .map(|t| (t.id, t.name.clone(), src.midi_out.contains(&t.id)))
+            .collect()
+    };
+    if targets.is_empty() {
+        ui.label(egui::RichText::new("No other track has an instrument.").color(Tokens::current().text_dim));
+    }
+    for (to, name, on) in targets {
+        if menu_row(ui, on, &name) {
+            let _ = app.run("mix.midi_out", json!({"track": id.0, "to": to.0, "on": !on}));
+            ui.close();
+        }
+    }
+    if app.engine.session().track(id).is_some_and(|t| !t.midi_out.is_empty()) && ui.button("Clear routes").clicked() {
+        let _ = app.run("mix.midi_out", json!({"track": id.0, "on": false}));
+        ui.close();
+    }
+}
+
 /// What a plugin slot shows at its left: a dot for inserts, the send's letter, or an arrow for
 /// a send on a short track.
 #[derive(Clone, Copy)]
@@ -619,7 +690,7 @@ pub(crate) fn insert_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: 
 pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, occupied: bool) {
     let search = MenuSearch::show(ui, egui::Id::new(("plugin-search", id.0, slot)), "Search plugins…");
     if search.typing() {
-        if let Some(plugin) = plugin_search(ui, &search, false) {
+        if let Some(plugin) = plugin_search(ui, &search, SlotKind::Insert) {
             run_pick(app, ui, "mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}));
         }
         return;
@@ -648,7 +719,7 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
             }
         });
     }
-    if let Some(plugin) = hosted_menus(ui, false) {
+    if let Some(plugin) = hosted_menus(ui, SlotKind::Insert) {
         run_pick(app, ui, "mix.insert", json!({"track": id.0, "slot": slot, "plugin": plugin}));
     }
 }
@@ -660,12 +731,13 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let slot = soundcraft_mix::INSTRUMENT_SLOT;
     let search = MenuSearch::show(ui, egui::Id::new(("instrument-search", id.0)), "Search instruments…");
     if search.typing() {
-        if let Some(plugin) = plugin_search(ui, &search, true) {
+        if let Some(plugin) = plugin_search(ui, &search, SlotKind::Instrument) {
             run_pick(app, ui, "mix.instrument", json!({"track": id.0, "plugin": plugin}));
         }
         return;
     }
     let current = app.engine.session().track(id).and_then(|t| t.instrument.clone());
+    let mut failure: Option<String> = None;
     if let Some(info) = current.as_ref().and_then(|i| plugin_info(&i.plugin)) {
         ui.label(egui::RichText::new(info.name).strong());
         if current.as_ref().is_some_and(|i| !soundcraft_mix::is_third_party(&i.plugin)) && ui.button("Edit Parameters…").clicked() {
@@ -682,24 +754,34 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
                     p.close_editor(id, slot);
                     ui.close();
                 }
+            } else if let Some(why) = editor_blocked_reason(current.as_ref().map(|i| i.plugin.as_str()).unwrap_or_default()) {
+                // This platform has no window for the plugin's view: say so rather than fail.
+                ui.add_enabled(false, egui::Button::new("Open Plugin Editor")).on_disabled_hover_text(why);
             } else if ui.button("Open Plugin Editor").clicked() {
-                if let Err(e) = p.open_editor(id, slot) {
-                    app.ui.status = format!("{}: {e}", info.name);
+                match p.open_editor(id, slot) {
+                    Ok(()) => ui.close(),
+                    Err(e) => failure = Some(e),
                 }
-                ui.close();
             }
+        }
+        if let Some(e) = failure {
+            // The status line belongs to the Edit window; this menu may be the only thing the
+            // user is looking at, so the reason is shown here too.
+            let msg = format!("{}: {e}", info.name);
+            app.ui.status = msg.clone();
+            ui.label(egui::RichText::new(msg).color(Tokens::current().meter_red));
         }
         ui.separator();
     }
     let mut picked = None;
     ui.menu_button("Built-in", |ui| {
-        for p in soundcraft_dsp::plugins().iter().filter(|p| p.is_instrument) {
+        for p in soundcraft_dsp::plugins().iter().filter(|p| SlotKind::Instrument.takes(p.is_instrument, p.midi_out, p.is_midi_processor)) {
             if ui.button(p.name).clicked() {
                 picked = Some(p.id.to_string());
             }
         }
     });
-    if let Some(p) = hosted_menus(ui, true) {
+    if let Some(p) = hosted_menus(ui, SlotKind::Instrument) {
         picked = Some(p);
     }
     if let Some(plugin) = picked {
@@ -718,19 +800,22 @@ fn run_pick(app: &mut SoundApp, ui: &Ui, cmd: &str, params: serde_json::Value) {
 /// The plugins whose name or vendor holds the search text: the built-in ones, then Audio Units
 /// (listing them creates no instances) and whichever of CLAP and VST3 have been scanned, with a
 /// button to scan each of the others. Returns the id picked.
-fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<String> {
-    let mut built_in: Vec<&soundcraft_dsp::PluginInfo> =
-        soundcraft_dsp::plugins().iter().copied().filter(|p| p.is_instrument == instruments && search.matches(p.name)).collect();
+fn plugin_search(ui: &mut Ui, search: &MenuSearch, slot: SlotKind) -> Option<String> {
+    let mut built_in: Vec<&soundcraft_dsp::PluginInfo> = soundcraft_dsp::plugins()
+        .iter()
+        .copied()
+        .filter(|p| slot.takes(p.is_instrument, p.midi_out, p.is_midi_processor) && search.matches(p.name))
+        .collect();
     built_in.sort_by_cached_key(|p| p.name.to_lowercase());
     let (clap, vst3) = (soundcraft_clap_host::cached(), soundcraft_vst3_host::cached());
     let mut hosted: Vec<(MenuPlugin, &str)> = Vec::new();
-    for d in clap.iter().flatten().filter(|d| d.is_instrument == instruments) {
+    for d in clap.iter().flatten().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor)) {
         hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "CLAP"));
     }
-    for d in vst3.iter().flatten().filter(|d| d.is_instrument == instruments) {
+    for d in vst3.iter().flatten().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor)) {
         hosted.push((MenuPlugin { id: d.id.clone(), name: d.name.clone(), vendor: d.vendor.clone() }, "VST3"));
     }
-    for d in soundcraft_au_host::scan().into_iter().filter(|d| d.is_instrument == instruments) {
+    for d in soundcraft_au_host::scan().into_iter().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor)) {
         hosted.push((MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }, "AU"));
     }
     hosted.retain(|(p, _)| search.matches(&p.name) || search.matches(&p.vendor));
@@ -841,27 +926,52 @@ struct MenuPlugin {
     vendor: String,
 }
 
-/// The CLAP, VST3 and (on macOS) Audio Units submenus, of effects or of instruments; returns the
-/// id picked. Each format is scanned the first time its submenu opens, then cached by its host.
-fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
+/// Which slot a plugin menu fills: an audio insert, or the instrument slot — the one slot the
+/// mixer feeds MIDI to, where a synth or a MIDI generator (note/chord generator, arpeggiator)
+/// belongs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    Insert,
+    Instrument,
+}
+
+impl SlotKind {
+    /// True when a plugin (built-in or hosted) belongs in this slot's menu. An insert carries
+    /// audio only, so an instrument or a MIDI generator dropped into one would never see its MIDI;
+    /// both belong in the instrument slot, the one slot the mixer feeds MIDI to.
+    pub fn takes(self, is_instrument: bool, midi_out: bool, is_midi_processor: bool) -> bool {
+        match self {
+            SlotKind::Insert => !is_instrument && !midi_out && !is_midi_processor,
+            SlotKind::Instrument => is_instrument || midi_out,
+        }
+    }
+}
+
+/// The CLAP, VST3 and (on macOS) Audio Units submenus, of effects or of MIDI-capable plugins;
+/// returns the id picked. Each format is scanned the first time its submenu opens, then cached by
+/// its host.
+fn hosted_menus(ui: &mut Ui, slot: SlotKind) -> Option<String> {
     let mut picked = None;
+    let (clap_empty, vst3_empty, au_empty) = match slot {
+        SlotKind::Insert => ("No CLAP audio effects found", "No VST3 audio effects found", "No Audio Unit effects found"),
+        SlotKind::Instrument => ("No CLAP instruments found", "No VST3 instruments found", "No Audio Unit instruments found"),
+    };
     ui.menu_button("CLAP", |ui| {
-        let list = soundcraft_clap_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No CLAP plugins found") {
+        let list = soundcraft_clap_host::scan().into_iter().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor));
+        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), clap_empty) {
             picked = Some(p);
         }
     });
     ui.menu_button("VST3", |ui| {
-        let list = soundcraft_vst3_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No VST3 plugins found") {
+        let list = soundcraft_vst3_host::scan().into_iter().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor));
+        if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), vst3_empty) {
             picked = Some(p);
         }
     });
     if cfg!(target_os = "macos") {
         ui.menu_button("Audio Units", |ui| {
-            let list = soundcraft_au_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
-            if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No Audio Units found")
-            {
+            let list = soundcraft_au_host::scan().into_iter().filter(|d| slot.takes(d.is_instrument, d.midi_out, d.is_midi_processor));
+            if let Some(p) = vendor_menus(ui, list.map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), au_empty) {
                 picked = Some(p);
             }
         });
@@ -904,6 +1014,17 @@ pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
         .or_else(|| soundcraft_clap_host::plugin_info(id))
         .or_else(|| soundcraft_vst3_host::plugin_info(id))
         .or_else(|| soundcraft_au_host::plugin_info(id))
+}
+
+/// Why this plugin's own editor cannot be opened here, when it cannot. VST3 editor windows are
+/// hosted on macOS and Windows only; on Linux and the BSDs there is no window to put the plugin's
+/// view into, so the button says so instead of failing silently when it is pressed.
+pub fn editor_blocked_reason(plugin: &str) -> Option<&'static str> {
+    if plugin.starts_with(soundcraft_vst3_host::ID_PREFIX) && !soundcraft_vst3_host::editors_supported() {
+        Some("VST3 plugin editors are hosted on macOS and Windows only")
+    } else {
+        None
+    }
 }
 
 pub(crate) fn send_slot(app: &mut SoundApp, ui: &mut Ui, track: &Track, slot: usize, r: Rect) {
@@ -1286,7 +1407,7 @@ fn route_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, input: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_send_db, editable_readout, parse_db, parse_pan};
+    use super::{SlotKind, dragged_send_db, editable_readout, editor_blocked_reason, parse_db, parse_pan};
     use egui::{Event, Modifiers, PointerButton, Rect, pos2, vec2};
 
     #[test]
@@ -1349,5 +1470,36 @@ mod tests {
         }
         frame(vec![], true);
         assert_eq!(frame(vec![], true), (true, None), "hidden, the field lost focus, so the readout is back");
+    }
+
+    #[test]
+    fn the_editor_button_says_why_it_cannot_open() {
+        // A VST3 plugin's editor window is hosted on macOS, Windows and, where X11 is
+        // available, on Linux and the BSDs. Where it is not, the button says so instead of
+        // failing silently when it is pressed.
+        let vst3 = "vst3:0123456789ABCDEFfedcba9876543210";
+        if soundcraft_vst3_host::editors_supported() {
+            assert!(editor_blocked_reason(vst3).is_none());
+        } else {
+            assert!(editor_blocked_reason(vst3).is_some());
+        }
+        // A built-in plugin has no editor of its own, and CLAP editors are hosted separately.
+        assert!(editor_blocked_reason("eq_7band").is_none());
+        assert!(editor_blocked_reason("clap:com.vendor.plugin").is_none());
+    }
+
+    #[test]
+    fn midi_capable_plugins_are_offered_only_where_the_mixer_feeds_midi() {
+        // The instrument slot is the one slot that sees MIDI, so it takes synths and MIDI
+        // generators alike; an audio insert takes neither, which is why a note generator such as
+        // InstaComposer used to be unselectable at all.
+        assert!(SlotKind::Instrument.takes(true, false, false), "a synth in the instrument slot");
+        assert!(SlotKind::Instrument.takes(false, true, true), "a MIDI generator with supported output");
+        assert!(!SlotKind::Instrument.takes(false, false, true), "unsupported MIDI output is not offered as a generator");
+        assert!(!SlotKind::Instrument.takes(false, false, false), "a reverb is not an instrument");
+        assert!(SlotKind::Insert.takes(false, false, false), "a reverb as an insert");
+        assert!(!SlotKind::Insert.takes(true, false, false), "a synth is not an audio insert");
+        assert!(!SlotKind::Insert.takes(false, true, false), "a MIDI generator is not an audio insert");
+        assert!(!SlotKind::Insert.takes(false, false, true), "an unsupported MIDI processor is not an audio insert");
     }
 }

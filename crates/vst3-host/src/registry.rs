@@ -41,6 +41,8 @@ pub fn load_bundle(path: &Path) -> Result<Vec<Vst3Descriptor>, Vst3Error> {
                 id: format!("{}{class_id}", crate::ID_PREFIX),
                 category: paths::category_from_sub_categories(&subs),
                 is_instrument: paths::is_instrument(&subs),
+                is_midi_processor: paths::is_midi_processor(&subs),
+                midi_out: paths::midi_out(&subs),
                 class_id,
                 name: if c.name.is_empty() { "VST3 plugin".to_string() } else { c.name },
                 vendor: c.vendor,
@@ -186,6 +188,9 @@ fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
     let params: Vec<ParamInfo> =
         inst.params().iter().filter(|p| p.flags & (PARAM_HIDDEN | PARAM_READ_ONLY | PARAM_BYPASS) == 0).map(|p| param_info(inst, p)).collect();
     let short: String = d.name.chars().take(8).collect();
+    // The event output bus is the runtime capability. The descriptor's sub-category is only a
+    // menu hint and must not make a plugin with no output bus appear to generate MIDI.
+    let midi_out = inst.has_event_output();
     Box::leak(Box::new(PluginInfo {
         id: leak(d.id.clone()),
         name: leak(d.name.clone()),
@@ -193,6 +198,8 @@ fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
         category: d.category,
         params: Box::leak(params.into_boxed_slice()),
         is_instrument: d.is_instrument,
+        is_midi_processor: d.is_midi_processor,
+        midi_out,
         audiosuite: false,
     }))
 }

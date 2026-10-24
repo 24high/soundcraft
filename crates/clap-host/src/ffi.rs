@@ -54,7 +54,7 @@ pub(crate) const MAX_PORT_CHANNELS: u32 = 64;
 /// Most feature strings read from a descriptor.
 const MAX_FEATURES: usize = 64;
 /// Capacity of the per-block event list (preallocated: `process` never allocates).
-pub(crate) const EVENT_CAP: usize = 1024;
+pub(crate) const EVENT_CAP: usize = 2048;
 /// Largest plugin state we accept from `clap_plugin_state.save` (hostile-input cap).
 pub(crate) const MAX_STATE_BYTES: usize = 64 << 20;
 /// Most editor parameter edits buffered between two UI frames.
@@ -507,12 +507,15 @@ pub(crate) enum Event {
     },
     NoteOn {
         time: u32,
+        channel: u8,
         key: u8,
         velocity: f64,
     },
     NoteOff {
         time: u32,
+        channel: u8,
         key: u8,
+        velocity: f64,
     },
     /// A raw MIDI 1.0 message (for plugins whose note port speaks only MIDI).
     Midi {
@@ -571,21 +574,21 @@ impl RawEvent {
                 key: -1,
                 value,
             }),
-            Event::NoteOn { time, key, velocity } => RawEvent::Note(clap_event_note {
+            Event::NoteOn { time, channel, key, velocity } => RawEvent::Note(clap_event_note {
                 header: header(size_of::<clap_event_note>(), CLAP_EVENT_NOTE_ON, time),
                 note_id: -1,
                 port_index: 0,
-                channel: 0,
+                channel: i16::from(channel),
                 key: i16::from(key),
                 velocity,
             }),
-            Event::NoteOff { time, key } => RawEvent::Note(clap_event_note {
+            Event::NoteOff { time, channel, key, velocity } => RawEvent::Note(clap_event_note {
                 header: header(size_of::<clap_event_note>(), CLAP_EVENT_NOTE_OFF, time),
                 note_id: -1,
                 port_index: 0,
-                channel: 0,
+                channel: i16::from(channel),
                 key: i16::from(key),
-                velocity: 0.0,
+                velocity,
             }),
             Event::Midi { time, data } => {
                 RawEvent::Midi(clap_event_midi { header: header(size_of::<clap_event_midi>(), CLAP_EVENT_MIDI, time), port_index: 0, data })
@@ -1629,6 +1632,19 @@ mod hostwin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_event_conversion_keeps_channel_and_release_velocity() {
+        let on = RawEvent::from_event(&Event::NoteOn { time: 11, channel: 7, key: 64, velocity: 0.75 }, 3);
+        let RawEvent::Note(on) = on else { return };
+        assert_eq!((on.header.time, on.header.type_, on.channel, on.key), (8, CLAP_EVENT_NOTE_ON, 7, 64));
+        assert_eq!(on.velocity, 0.75);
+
+        let off = RawEvent::from_event(&Event::NoteOff { time: 12, channel: 7, key: 64, velocity: 0.5 }, 3);
+        let RawEvent::Note(off) = off else { return };
+        assert_eq!((off.header.time, off.header.type_, off.channel, off.key), (9, CLAP_EVENT_NOTE_OFF, 7, 64));
+        assert_eq!(off.velocity, 0.5);
+    }
 
     #[test]
     fn the_transport_reaches_clap_in_fixed_point() {

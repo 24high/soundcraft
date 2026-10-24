@@ -1,6 +1,6 @@
 # Plugin parity: built-in processors and plugin hosting
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** trivial (mix.instrument sets built-in instrument parameters in params (#265); previously minor: plugin editors on Windows) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-20 · **Last updated:** 2026-10-20 · **Change:** minor (VST3 MIDI generator output, track routing and an X11 editor host for Linux) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Pro Tools users live in plugins: the bundled set covers everyday mixing, and third-party plugins
 cover the rest. This doc tracks both. Our plugins have our own names and are written from
@@ -41,11 +41,12 @@ User report #152: a saved instrument level does not reach the bounce.
 | VST2, LV2, LADSPA | — | ❌ (#30) | Beyond Pro Tools; VST2 SDK is no longer licensable |
 | Scan, vendor menus, instrument picker | ✅ | ✅ | #23 |
 | Audio, parameters, automation, latency (PDC) | ✅ | ✅ | |
-| Notes / MIDI to instruments | ✅ | ✅ | But no live MIDI input (G-02) |
+| Notes / MIDI to instruments | ✅ | ✅ | MIDI clips feed instrument slots; VST3 event-output MIDI can route in real time to another track's instrument. No external MIDI input (G-02). |
+| MIDI-generator output | ✅ | 🟡 | VST3 event buses are collected and routed with sample offsets, channels and note velocities. CLAP and Audio Unit MIDI output are not yet collected; CLAP note-effects are not offered as working generators. |
 | State saved in sessions, presets | ✅ | ✅ | |
 | Create/destroy off the audio thread | ✅ | ✅ | |
 | Editors: CLAP | — | 🟡 floating windows; embedded editors on Windows | Embedded on macOS/Linux missing |
-| Editors: VST3 | — | 🟡 macOS (verified with a commercial pitch editor) and Windows (verified with a free JUCE compressor) | Linux views missing |
+| Editors: VST3 | — | 🟡 macOS (verified with a commercial pitch editor), Windows (verified with a free JUCE compressor) and Linux/X11 (verified with a native Linux VST3) | A Windows VST3 under Wine (yabridge) may still show an empty window: the plugin's own window inside Wine stays unmapped |
 | Editors: AU | — | ❌ | Cocoa view hosting missing |
 | Multiple editor pages | ✅ | 🟡 | #6 |
 | macOS hardened-runtime entitlement for third-party code | ✅ | ❌ | #153, #149 — signed builds refuse third-party VST3 |
@@ -58,6 +59,7 @@ User report #152: a saved instrument level does not reach the bounce.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-20 | minor | VST3 output events and same-block track-to-track MIDI routing; an X11 editor host for Linux; CLAP/AU output remains unsupported |
 | 2026-10-13 | trivial | mix.instrument sets built-in instrument parameters in params (#265) |
 | 2026-10-12 | minor | Editors: VST3 and embedded CLAP editors on Windows |
 | 2026-10-10 | major | Created: built-in processor inventory by category and third-party hosting checklist |

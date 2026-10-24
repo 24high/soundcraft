@@ -19,6 +19,8 @@ pub static SAT_INFO: PluginInfo = PluginInfo {
     category: Category::Harmonic,
     params: &SAT_PARAMS,
     is_instrument: false,
+    is_midi_processor: false,
+    midi_out: false,
     audiosuite: true,
 };
 
@@ -137,6 +139,8 @@ pub static LOFI_INFO: PluginInfo = PluginInfo {
     category: Category::Harmonic,
     params: &LOFI_PARAMS,
     is_instrument: false,
+    is_midi_processor: false,
+    midi_out: false,
     audiosuite: true,
 };
 
@@ -240,6 +244,8 @@ pub static RECT_INFO: PluginInfo = PluginInfo {
     category: Category::Harmonic,
     params: &RECT_PARAMS,
     is_instrument: false,
+    is_midi_processor: false,
+    midi_out: false,
     audiosuite: true,
 };
 

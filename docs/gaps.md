@@ -1,6 +1,6 @@
 # Where SoundCraft falls short of Pro Tools
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (G-01: audio device settings and opt-in ASIO) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-20 · **Last updated:** 2026-10-20 · **Change:** minor (G-02: internal VST3 MIDI routing done; hardware I/O still missing) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 Every known shortfall, one entry each, ranked by how much it stops a Pro Tools user from doing
 real work in SoundCraft. This is the work list: pick from the top. Rows marked **alpha blocker**
@@ -60,9 +60,13 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 
 ### G-02. MIDI devices
 
-- **Missing:** all MIDI hardware I/O. No `midir`/CoreMIDI/WinMM/ALSA sequencer code exists;
+- **Done (2026-10-20):** VST3 MIDI-generator events can route to another track's instrument in the
+  same block, with persistent session routes, sample offsets, MIDI channels, cycle rejection and
+  bounded event queues. This is internal plugin routing only.
+- **Still missing:** all MIDI hardware I/O. No `midir`/CoreMIDI/WinMM/ALSA sequencer code exists;
   `setup.midi_input_devices` and `setup.midi_studio` only store names. You cannot record from a
-  keyboard, play a hosted instrument live, drive external synths, or send MIDI clock/MTC.
+  keyboard, drive external synths, or send MIDI clock/MTC. CLAP and Audio Unit plugin MIDI output
+  are not yet collected.
   `midi_editor.rs:288` notes audition "needs a live MIDI input path".
 - **Impact:** MIDI production is limited to drawing notes and importing SMF.
 - **Estimate:** ≈ 20–35 h (device layer, realtime input to armed tracks and instruments with
@@ -183,7 +187,8 @@ See [`ui-parity.md`](ui-parity.md). ≈ 60–100 h.
 ### G-20. MIDI and instrument depth
 
 MIDI learn, a sampler (PR #108), drum machine depth, notation editing (tuplets, lyrics,
-articulations, parts). ≈ 40–60 h.
+articulations, parts). VST3-generated MIDI now routes between track instruments; external MIDI
+device I/O remains G-02. ≈ 40–60 h.
 
 ### G-21. Compressed export
 
@@ -198,6 +203,7 @@ missing. Out of scope unless the owner decides otherwise.
 ## Revision history
 
 | Date | Change | Summary |
+| 2026-10-20 | minor | G-02 records internal VST3 MIDI routing as done while hardware MIDI I/O remains open |
 |---|---|---|
 | 2026-10-12 | minor | G-01 shrunk: audio device, rate and buffer choice; opt-in ASIO |
 | 2026-10-10 | minor | Marked the alpha blockers (G-01, G-02, G-03; parts of G-05 and G-06) from the core-workflow gate |
